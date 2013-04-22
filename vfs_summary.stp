@@ -1,0 +1,192 @@
+#!/usr/bin/stap -g
+# This script summarizes filesystem and disk activity
+
+%{
+#include <linux/file.h>
+%}
+
+# init
+global path_prefix;
+global bio_times[8192];
+global inum_times;
+global filenames;
+global vfs_br;
+global vfs_bw;
+global blk_br;
+global blk_bw;
+global inum_proc;
+global fd_inum;
+global count = 0;
+global show_header = 1;
+
+# let's do some checks up-front
+probe begin {
+	if ($# != 1) {
+		printf("Specify a path component to monitor\n");
+		exit();
+	}
+	if (@1 == ".") {
+		path_prefix = "";
+	} else {
+		path_prefix = @1;
+	}
+	printf("Script running...\n");
+}
+
+# get inode number (if exists) from file descriptor
+function __fd_inum:long(fd:long) %{ /* unprivileged */
+	struct file* file;
+	struct dentry* dentry;
+	struct inode* inode;
+	unsigned long inum;
+	THIS->__retvalue = 0;
+	file = fget(THIS->fd);
+	if (file) {
+		dentry = kread(&(file->f_dentry));
+		if (dentry) {
+			inode = kread(&(dentry->d_inode));
+			if (inode) {
+				THIS->__retvalue = kread(&(inode->i_ino));
+			}
+		}
+	}
+	CATCH_DEREF_FAULT();
+%}
+
+# anytime a file descriptor is dup'd, we need to update our tables
+# to track the new FD
+function dup_fixup(pid:long,old:long,new:long) {
+	fd_inum[pid,new] = fd_inum[pid,old];
+	delete fd_inum[pid,old];
+}
+
+probe syscall.dup.return {
+	old = $fildes;
+	new = returnval();
+	if (fd_inum[pid(),old]) {
+		dup_fixup(pid(), old, new);
+	}
+}
+
+probe syscall.dup2.return {
+	old = $oldfd;
+	new = $newfd;
+	if (fd_inum[pid(),old]) {
+		dup_fixup(pid(), old, new);
+	}
+}
+
+probe ioblock.request {
+	if ([ino] in filenames) {
+		bio_times[$bio] = gettimeofday_us();
+		if (BIO_READ == bio_rw_num(rw)) {
+			blk_br[ino] <<< size;
+		} else {
+			blk_bw[ino] <<< size;
+		}
+	}
+}
+
+probe ioblock.end {
+	if ([ino] in filenames) {
+		# collect the IO time for this inode
+		inum_times[ino] <<< (gettimeofday_us() - bio_times[$bio]);
+		delete bio_times[$bio];
+	}
+}
+
+probe syscall.open.return {
+	# only track filenames that the user asked for
+	filename = user_string($filename);
+	fd = returnval();
+	if (1 == isinstr(filename, path_prefix)) {
+		inum = __fd_inum(fd);
+		filenames[inum] = filename;
+		inum_proc[inum] = execname();
+		fd_inum[pid(),fd] = inum;
+	}
+}
+
+probe syscall.read.return, syscall.readv.return {
+	if ([pid(),$fd] in fd_inum) {
+		if (0 < returnval()) {
+			vfs_br[fd_inum[pid(),$fd]] <<< returnval();
+		}
+	}
+}
+
+probe syscall.write.return, syscall.writev.return {
+	if ([pid(),$fd] in fd_inum) {
+		if (0 < returnval()) {
+			vfs_bw[fd_inum[pid(),$fd]] <<< returnval();
+		}
+	}
+}
+
+probe syscall.sendfile.return {
+	if ([pid(),$in_fd] in fd_inum) {
+		if (0 < returnval()) {
+			vfs_br[fd_inum[pid(),$in_fd]] <<< returnval();
+		}
+	}
+}
+
+probe syscall.close.return {
+	delete fd_inum[pid(),$fd];
+}
+
+function b_to_kb(bytes:long) {
+	return bytes / 1024;
+}
+
+function us_to_ms(usec:long) {
+	return usec / 1000;
+}
+
+probe timer.s(1) {
+	if ((count % 10 == 0) && (show_header == 1)) {
+		if (count == 0) {
+			count++;
+		}
+		printf("\n");
+		printf("%6s %6s %6s %6s %6s %6s %4s\n",
+					 "BIO_MS", "BIO_KR", "BIO_KW", "VFS_KR", "VFS_KW", "RD_HIT", "PATH");
+		printf("%6s %6s %6s %6s %6s %6s %s\n", "======", "======", "======",
+					 "======", "======", "======", "======");
+		show_header = 0;
+	}
+	foreach ([inum] in filenames) {
+		sum_blk_br_inum = @sum(blk_br[inum]);
+		sum_blk_bw_inum = @sum(blk_bw[inum]);
+		sum_vfs_br_inum = @sum(vfs_br[inum]);
+		sum_vfs_bw_inum = @sum(vfs_bw[inum]);
+		# sometimes the bytes read from the block device are more than what
+		# was requested from VFS.  this isn't an issue, but our calcs need to
+		# account for it.
+		if (sum_vfs_br_inum - sum_blk_br_inum < 0) {
+			cached_bytes = 0;
+		} else {
+			cached_bytes = sum_vfs_br_inum - sum_blk_br_inum;
+		}
+		cache_hit_ratio = 0;
+		if (sum_vfs_br_inum > 0) {
+			cache_hit_ratio = (200 * cached_bytes + 1) / (sum_vfs_br_inum * 2);
+		}
+		if (0 < sum_blk_br_inum + sum_blk_bw_inum +
+		    sum_vfs_br_inum + sum_vfs_bw_inum) {
+			printf("%6d %6d %6d %6d %6d %6d %.38s\n",
+			       us_to_ms(@sum(inum_times[inum])),
+			       b_to_kb(sum_blk_br_inum), b_to_kb(sum_blk_bw_inum),
+			       b_to_kb(sum_vfs_br_inum), b_to_kb(sum_vfs_bw_inum),
+			       cache_hit_ratio,
+			       filenames[inum]);
+			count++;
+			show_header = 1;
+		}
+	}
+	delete inum_times;
+	delete blk_br;
+	delete blk_bw;
+	delete vfs_br;
+	delete vfs_bw;
+}
